@@ -28,7 +28,8 @@ import (
 )
 
 const (
-	MaxLineLength      = 76                             // MaxLineLength is the maximum line length per RFC 2045
+	// MaxLineLength is the maximum line length per RFC 2045
+	MaxLineLength      = 76
 	defaultContentType = "text/plain; charset=us-ascii" // defaultContentType is the default Content-Type according to RFC 2045, section 5.2
 )
 
@@ -392,19 +393,18 @@ func (e *Email) Send(addr string, a smtp.Auth) error {
 
 // Select and parse an SMTP envelope sender address.  Choose Email.Sender if set, or fallback to Email.From.
 func (e *Email) parseSender() (string, error) {
-	if e.Sender != "" {
+	if len(e.Sender) > 0 {
 		sender, err := mail.ParseAddress(e.Sender)
 		if err != nil {
 			return "", err
 		}
 		return sender.Address, nil
-	} else {
-		from, err := mail.ParseAddress(e.From)
-		if err != nil {
-			return "", err
-		}
-		return from.Address, nil
 	}
+	from, err := mail.ParseAddress(e.From)
+	if err != nil {
+		return "", err
+	}
+	return from.Address, nil
 }
 
 // SendWithTLS sends an email with an optional TLS config.
@@ -433,8 +433,6 @@ func (e *Email) SendWithTLS(addr string, a smtp.Auth, t *tls.Config) error {
 	if err != nil {
 		return err
 	}
-	// Taken from the standard library
-	// https://github.com/golang/go/blob/master/src/net/smtp/smtp.go#L300
 
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
