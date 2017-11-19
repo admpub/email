@@ -289,14 +289,14 @@ func (e *Email) msgHeaders() (textproto.MIMEHeader, error) {
 }
 
 func writeMessage(buff *bytes.Buffer, msg []byte, multipart bool, mediaType string, w *multipart.Writer) error {
+	header := textproto.MIMEHeader{
+		"Content-Transfer-Encoding": {"quoted-printable"},
+	}
 	if multipart {
-		header := textproto.MIMEHeader{
-			"Content-Type":              {mediaType + "; charset=UTF-8"},
-			"Content-Transfer-Encoding": {"quoted-printable"},
-		}
-		if _, err := w.CreatePart(header); err != nil {
-			return err
-		}
+		header["Content-Type"] = []string{mediaType + "; charset=UTF-8"}
+	}
+	if _, err := w.CreatePart(header); err != nil {
+		return err
 	}
 
 	qp := quotedprintable.NewWriter(buff)
