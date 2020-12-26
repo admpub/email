@@ -1,8 +1,11 @@
 package email
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"io"
@@ -64,6 +67,74 @@ func TestEmailText(t *testing.T) {
 		t.Fatal("Content-type header is invalid: ", ct)
 	} else if mt != "text/plain" {
 		t.Fatalf("Content-type expected \"text/plain\", not %v", mt)
+	}
+}
+
+func TestEmailWithHTMLAttachments(t *testing.T) {
+	e := prepareEmail()
+
+	// Set plain text to exercise "mime/alternative"
+	e.Text = []byte("Text Body is, of course, supported!\n")
+
+	e.HTML = []byte("<html><body>This is a text.</body></html>")
+
+	// Set HTML attachment to exercise "mime/related".
+	attachment, err := e.Attach(bytes.NewBufferString("Rad attachment"), "rad.txt", "image/png; charset=utf-8")
+	if err != nil {
+		t.Fatal("Could not add an attachment to the message: ", err)
+	}
+	attachment.HTMLRelated = true
+
+	b, err := e.Bytes()
+	if err != nil {
+		t.Fatal("Could not serialize e-mail:", err)
+	}
+
+	// Print the bytes for ocular validation and make sure no errors.
+	//fmt.Println(string(b))
+
+	// TODO: Verify the attachments.
+	s := &trimReader{rd: bytes.NewBuffer(b)}
+	tp := textproto.NewReader(bufio.NewReader(s))
+	// Parse the main headers
+	hdrs, err := tp.ReadMIMEHeader()
+	if err != nil {
+		t.Fatal("Could not parse the headers:", err)
+	}
+	// Recursively parse the MIME parts
+	ps, err := parseMIMEParts(hdrs, tp.R)
+	if err != nil {
+		t.Fatal("Could not parse the MIME parts recursively:", err)
+	}
+
+	plainTextFound := false
+	htmlFound := false
+	imageFound := false
+	if expected, actual := 3, len(ps); actual != expected {
+		t.Error("Unexpected number of parts. Expected:", expected, "Was:", actual)
+	}
+	for _, part := range ps {
+		// part has "header" and "body []byte"
+		ct := part.header.Get("Content-Type")
+		if strings.Contains(ct, "image/png") {
+			imageFound = true
+		}
+		if strings.Contains(ct, "text/html") {
+			htmlFound = true
+		}
+		if strings.Contains(ct, "text/plain") {
+			plainTextFound = true
+		}
+	}
+
+	if !plainTextFound {
+		t.Error("Did not find plain text part.")
+	}
+	if !htmlFound {
+		t.Error("Did not find HTML part.")
+	}
+	if !imageFound {
+		t.Error("Did not find image part.")
 	}
 }
 
@@ -247,11 +318,59 @@ func TestEmailAttachment(t *testing.T) {
 	}
 }
 
+func TestHeaderEncoding(t *testing.T) {
+	cases := []struct {
+		field string
+		have  string
+		want  string
+	}{
+		{
+			field: "From",
+			have:  "Needs Encóding <encoding@example.com>, Only ASCII <foo@example.com>",
+			want:  "=?UTF-8?q?Needs_Enc=C3=B3ding?= <encoding@example.com>, Only ASCII <foo@example.com>\r\n",
+		},
+		{
+			field: "To",
+			have:  "Keith Moore <moore@cs.utk.edu>, Keld Jørn Simonsen <keld@dkuug.dk>",
+			want:  "Keith Moore <moore@cs.utk.edu>, =?UTF-8?q?Keld_J=C3=B8rn_Simonsen?= <keld@dkuug.dk>\r\n",
+		},
+		{
+			field: "Cc",
+			have:  "Needs Encóding <encoding@example.com>",
+			want:  "=?UTF-8?q?Needs_Enc=C3=B3ding?= <encoding@example.com>\r\n",
+		},
+		{
+			field: "Subject",
+			have:  "Subject with a 🐟",
+			want:  "=?UTF-8?q?Subject_with_a_=F0=9F=90=9F?=\r\n",
+		},
+		{
+			field: "Subject",
+			have:  "Subject with only ASCII",
+			want:  "Subject with only ASCII\r\n",
+		},
+	}
+	buff := &bytes.Buffer{}
+	for _, c := range cases {
+		header := make(textproto.MIMEHeader)
+		header.Add(c.field, c.have)
+		buff.Reset()
+		headerToBytes(buff, header)
+		want := fmt.Sprintf("%s: %s", c.field, c.want)
+		got := buff.String()
+		if got != want {
+			t.Errorf("invalid utf-8 header encoding. \nwant:%#v\ngot: %#v", want, got)
+		}
+	}
+}
+
 func TestEmailFromReader(t *testing.T) {
 	ex := &Email{
 		Subject: "Test Subject",
-		To:      []string{"Jordan Wright <jmwright798@gmail.com>"},
+		To:      []string{"Jordan Wright <jmwright798@gmail.com>", "also@example.com"},
 		From:    "Jordan Wright <jmwright798@gmail.com>",
+		Cc:      []string{"one@example.com", "Two <two@example.com>"},
+		Bcc:     []string{"three@example.com", "Four <four@example.com>"},
 		Text:    []byte("This is a test email with HTML Formatting. It also has very long lines so\nthat the content must be wrapped if using quoted-printable decoding.\n"),
 		HTML:    []byte("<div dir=\"ltr\">This is a test email with <b>HTML Formatting.</b>\u00a0It also has very long lines so that the content must be wrapped if using quoted-printable decoding.</div>\n"),
 	}
@@ -259,7 +378,9 @@ func TestEmailFromReader(t *testing.T) {
 	MIME-Version: 1.0
 Subject: Test Subject
 From: Jordan Wright <jmwright798@gmail.com>
-To: Jordan Wright <jmwright798@gmail.com>
+To: Jordan Wright <jmwright798@gmail.com>, also@example.com
+Cc: one@example.com, Two <two@example.com>
+Bcc: three@example.com, Four <four@example.com>
 Content-Type: multipart/alternative; boundary=001a114fb3fc42fd6b051f834280
 
 --001a114fb3fc42fd6b051f834280
@@ -293,7 +414,68 @@ d-printable decoding.</div>
 	if e.From != ex.From {
 		t.Fatalf("Incorrect \"From\": %#q != %#q", e.From, ex.From)
 	}
+	if len(e.To) != len(ex.To) {
+		t.Fatalf("Incorrect number of \"To\" addresses: %v != %v", len(e.To), len(ex.To))
+	}
+	if e.To[0] != ex.To[0] {
+		t.Fatalf("Incorrect \"To[0]\": %#q != %#q", e.To[0], ex.To[0])
+	}
+	if e.To[1] != ex.To[1] {
+		t.Fatalf("Incorrect \"To[1]\": %#q != %#q", e.To[1], ex.To[1])
+	}
+	if len(e.Cc) != len(ex.Cc) {
+		t.Fatalf("Incorrect number of \"Cc\" addresses: %v != %v", len(e.Cc), len(ex.Cc))
+	}
+	if e.Cc[0] != ex.Cc[0] {
+		t.Fatalf("Incorrect \"Cc[0]\": %#q != %#q", e.Cc[0], ex.Cc[0])
+	}
+	if e.Cc[1] != ex.Cc[1] {
+		t.Fatalf("Incorrect \"Cc[1]\": %#q != %#q", e.Cc[1], ex.Cc[1])
+	}
+	if len(e.Bcc) != len(ex.Bcc) {
+		t.Fatalf("Incorrect number of \"Bcc\" addresses: %v != %v", len(e.Bcc), len(ex.Bcc))
+	}
+	if e.Bcc[0] != ex.Bcc[0] {
+		t.Fatalf("Incorrect \"Bcc[0]\": %#q != %#q", e.Cc[0], ex.Cc[0])
+	}
+	if e.Bcc[1] != ex.Bcc[1] {
+		t.Fatalf("Incorrect \"Bcc[1]\": %#q != %#q", e.Bcc[1], ex.Bcc[1])
+	}
+}
 
+func TestNonAsciiEmailFromReader(t *testing.T) {
+	ex := &Email{
+		Subject: "Test Subject",
+		To:      []string{"Anaïs <anais@example.org>"},
+		Cc:      []string{"Patrik Fältström <paf@example.com>"},
+		From:    "Mrs ValÃ©rie Dupont <valerie.dupont@example.com>",
+		Text:    []byte("This is a test message!"),
+	}
+	raw := []byte(`
+	MIME-Version: 1.0
+Subject: =?UTF-8?Q?Test Subject?=
+From: Mrs =?ISO-8859-1?Q?Val=C3=A9rie=20Dupont?= <valerie.dupont@example.com>
+To: =?utf-8?q?Ana=C3=AFs?= <anais@example.org>
+Cc: =?ISO-8859-1?Q?Patrik_F=E4ltstr=F6m?= <paf@example.com>
+Content-type: text/plain; charset=ISO-8859-1
+
+This is a test message!`)
+	e, err := NewEmailFromReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("Error creating email %s", err.Error())
+	}
+	if e.Subject != ex.Subject {
+		t.Fatalf("Incorrect subject. %#q != %#q", e.Subject, ex.Subject)
+	}
+	if e.From != ex.From {
+		t.Fatalf("Incorrect \"From\": %#q != %#q", e.From, ex.From)
+	}
+	if e.To[0] != ex.To[0] {
+		t.Fatalf("Incorrect \"To\": %#q != %#q", e.To, ex.To)
+	}
+	if e.Cc[0] != ex.Cc[0] {
+		t.Fatalf("Incorrect \"Cc\": %#q != %#q", e.Cc, ex.Cc)
+	}
 }
 
 func TestNonMultipartEmailFromReader(t *testing.T) {
@@ -373,6 +555,100 @@ d-printable decoding.</div>
 	}
 	if e.From != ex.From {
 		t.Fatalf("Incorrect \"From\": %#q != %#q", e.From, ex.From)
+	}
+}
+
+func TestAttachmentEmailFromReader(t *testing.T) {
+	ex := &Email{
+		Subject: "Test Subject",
+		To:      []string{"Jordan Wright <jmwright798@gmail.com>"},
+		From:    "Jordan Wright <jmwright798@gmail.com>",
+		Text:    []byte("Simple text body"),
+		HTML:    []byte("<div dir=\"ltr\">Simple HTML body</div>\n"),
+	}
+	a, err := ex.Attach(bytes.NewReader([]byte("Let's just pretend this is raw JPEG data.")), "cat.jpeg", "image/jpeg")
+	if err != nil {
+		t.Fatalf("Error attaching image %s", err.Error())
+	}
+	b, err := ex.Attach(bytes.NewReader([]byte("Let's just pretend this is raw JPEG data.")), "cat-inline.jpeg", "image/jpeg")
+	if err != nil {
+		t.Fatalf("Error attaching inline image %s", err.Error())
+	}
+	raw := []byte(`
+From: Jordan Wright <jmwright798@gmail.com>
+Date: Thu, 17 Oct 2019 08:55:37 +0100
+Mime-Version: 1.0
+Content-Type: multipart/mixed;
+ boundary=35d10c2224bd787fe700c2c6f4769ddc936eb8a0b58e9c8717e406c5abb7
+To: Jordan Wright <jmwright798@gmail.com>
+Subject: Test Subject
+
+--35d10c2224bd787fe700c2c6f4769ddc936eb8a0b58e9c8717e406c5abb7
+Content-Type: multipart/alternative;
+ boundary=b10ca5b1072908cceb667e8968d3af04503b7ab07d61c9f579c15b416d7c
+
+--b10ca5b1072908cceb667e8968d3af04503b7ab07d61c9f579c15b416d7c
+Content-Transfer-Encoding: quoted-printable
+Content-Type: text/plain; charset=UTF-8
+
+Simple text body
+--b10ca5b1072908cceb667e8968d3af04503b7ab07d61c9f579c15b416d7c
+Content-Transfer-Encoding: quoted-printable
+Content-Type: text/html; charset=UTF-8
+
+<div dir=3D"ltr">Simple HTML body</div>
+
+--b10ca5b1072908cceb667e8968d3af04503b7ab07d61c9f579c15b416d7c--
+
+--35d10c2224bd787fe700c2c6f4769ddc936eb8a0b58e9c8717e406c5abb7
+Content-Disposition: attachment;
+ filename="cat.jpeg"
+Content-Id: <cat.jpeg>
+Content-Transfer-Encoding: base64
+Content-Type: image/jpeg
+
+TGV0J3MganVzdCBwcmV0ZW5kIHRoaXMgaXMgcmF3IEpQRUcgZGF0YS4=
+
+--35d10c2224bd787fe700c2c6f4769ddc936eb8a0b58e9c8717e406c5abb7
+Content-Disposition: inline;
+ filename="cat-inline.jpeg"
+Content-Id: <cat-inline.jpeg>
+Content-Transfer-Encoding: base64
+Content-Type: image/jpeg
+
+TGV0J3MganVzdCBwcmV0ZW5kIHRoaXMgaXMgcmF3IEpQRUcgZGF0YS4=
+
+--35d10c2224bd787fe700c2c6f4769ddc936eb8a0b58e9c8717e406c5abb7--`)
+	e, err := NewEmailFromReader(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("Error creating email %s", err.Error())
+	}
+	if e.Subject != ex.Subject {
+		t.Fatalf("Incorrect subject. %#q != %#q", e.Subject, ex.Subject)
+	}
+	if !bytes.Equal(e.Text, ex.Text) {
+		t.Fatalf("Incorrect text: %#q != %#q", e.Text, ex.Text)
+	}
+	if !bytes.Equal(e.HTML, ex.HTML) {
+		t.Fatalf("Incorrect HTML: %#q != %#q", e.HTML, ex.HTML)
+	}
+	if e.From != ex.From {
+		t.Fatalf("Incorrect \"From\": %#q != %#q", e.From, ex.From)
+	}
+	if len(e.Attachments) != 2 {
+		t.Fatalf("Incorrect number of attachments %d != %d", len(e.Attachments), 1)
+	}
+	if e.Attachments[0].Filename != a.Filename {
+		t.Fatalf("Incorrect attachment filename %s != %s", e.Attachments[0].Filename, a.Filename)
+	}
+	if !bytes.Equal(e.Attachments[0].Content, a.Content) {
+		t.Fatalf("Incorrect attachment content %#q != %#q", e.Attachments[0].Content, a.Content)
+	}
+	if e.Attachments[1].Filename != b.Filename {
+		t.Fatalf("Incorrect attachment filename %s != %s", e.Attachments[1].Filename, b.Filename)
+	}
+	if !bytes.Equal(e.Attachments[1].Content, b.Content) {
+		t.Fatalf("Incorrect attachment content %#q != %#q", e.Attachments[1].Content, b.Content)
 	}
 }
 
