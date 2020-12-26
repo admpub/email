@@ -90,7 +90,9 @@ func (p *Pool) get(timeout time.Duration) *client {
 
 	var deadline <-chan time.Time
 	if timeout >= 0 {
-		deadline = time.After(timeout)
+		t := time.NewTimer(timeout)
+		defer t.Stop()
+		deadline = t.C
 	}
 
 	for {
